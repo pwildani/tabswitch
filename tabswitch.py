@@ -3,13 +3,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import TypedDict, Protocol
 import argparse
+import configparser
 import json
 import os
 import re
-import regex
 import sys
 import typing
-import yaml
 
 import requests
 
@@ -26,7 +25,7 @@ except ImportError:
 T = typing.TypeVar("T")
 
 # Couldn't get zero width split working.
-LOWER_UPPER_TRANSITION = regex.compile("(?<=[a-z_])(?=[0-9A-Z])", flags=regex.VERSION1)
+#LOWER_UPPER_TRANSITION = regex.compile("(?<=[a-z_])(?=[0-9A-Z])", flags=regex.VERSION1)
 
 # Matches a word terminated by a lower-upper case transition,
 # or lower-digit transition, or whitespace
@@ -147,11 +146,14 @@ class Tabby:
         # Linux
         home = Path(os.environ["HOME"])
         xdg_config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
-        config_filename = xdg_config / appname / "config.yml"
+        config_filename = xdg_config / appname / "config.ini"
         # TODO: OSX, Windows
 
         with open(config_filename) as fh:
-            config = yaml.safe_load(fh)
+            cfg = configparser.ConfigParser()
+            cfg.read_string("[DEFAULT]\n" + fh.read())
+            config = cfg["DEFAULT"]
+
         api_root = config["api_root"]
         if api_root and not api_root.endswith("/"):
             api_root += "/"
@@ -426,77 +428,81 @@ def fuzzy_select_model(tabby: Tabby, query: list[str], args) -> bool:
         return False
     else:
         new_model = models[0]
-        print(new_model)
         r = tabby.swap_model(new_model, args)
         return display_progress(r)
 
 
-argparser = argparse.ArgumentParser()
-argparser.add_argument("mode", metavar="mode", type=str, nargs="?")
-argparser.add_argument(
-    "--ctx",
-    "--context-length",
-    type=int,
-    dest="max_seq_len",
-    required=False,
-)
-argparser.add_argument(
-    "-T",
-    "--prompt-template",
-    type=str,
-    dest="prompt_template",
-    default="",
-    required=False,
-)
-argparser.add_argument(
-    "--cache-mode",
-    type=str,
-    dest="cache_mode",
-    default="Q4",
-    choices=["Q4", "FP8", "FP16"],
-    required=False,
-)
-argparser.add_argument("words", metavar="modelword", type=str, nargs="*")
-args = argparser.parse_args()
-tabby = Tabby.from_app_config("tabswitch")
+def main():
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("mode", metavar="mode", type=str, nargs="?")
+    argparser.add_argument(
+        "--ctx",
+        "--context-length",
+        type=int,
+        dest="max_seq_len",
+        required=False,
+    )
+    argparser.add_argument(
+        "-T",
+        "--prompt-template",
+        type=str,
+        dest="prompt_template",
+        default="",
+        required=False,
+    )
+    argparser.add_argument(
+        "--cache-mode",
+        type=str,
+        dest="cache_mode",
+        default="Q4",
+        choices=["Q4", "FP8", "FP16"],
+        required=False,
+    )
+    argparser.add_argument("words", metavar="modelword", type=str, nargs="*")
+    args = argparser.parse_args()
+    tabby = Tabby.from_app_config("tabswitch")
 
-match args.mode:
-    case "help":
-        print(
-            "current, list, set-model <exact name>, model <approximate name>,"
-            "select-model <approximate name>, or just <approximate name>"
-        )
+    match args.mode:
+        case "help":
+            print(
+                "current, list, set-model <exact name>, "
+                "model <approximate name>, select-model <approximate name>, "
+                "or just <approximate name>"
+            )
 
-    case None | "current":
-        print(tabby.get_loaded_model())
+        case None | "current":
+            print(tabby.get_loaded_model())
 
-    case "unload":
-        tabby.unload()
+        case "unload":
+            tabby.unload()
 
-    case "ls" | "list" | "list-models":
-        query = args.words
-        if query:
-            model_names = tabby.model_names()
-            models = fuzzy_match(model_names, query, bias_fn=exllama2_bias)
-            for m, score in models:
-                print(f"{score:0.3}\t{m}")
-        else:
-            models = tabby.get_available_models()
-            models = [m["id"] for m in models]
-            models.sort()
-            for m in models:
-                print(m)
+        case "ls" | "list" | "list-models":
+            query = args.words
+            if query:
+                model_names = tabby.model_names()
+                models = fuzzy_match(model_names, query, bias_fn=exllama2_bias)
+                for m, score in models:
+                    print(f"{score:0.3}\t{m}")
+            else:
+                models = tabby.get_available_models()
+                models = [m["id"] for m in models]
+                models.sort()
+                for m in models:
+                    print(m)
 
-    case "set-model":
-        new_model = args.words[0]
-        r = tabby.swap_model(new_model, args)
-        display_progress(r) or sys.exit(1)
+        case "set-model":
+            new_model = args.words[0]
+            r = tabby.swap_model(new_model, args)
+            display_progress(r) or sys.exit(1)
 
-    case "model" | "select-model":
-        new_model = args.words
-        print(new_model)
-        fuzzy_select_model(tabby, new_model, args) or sys.exit(1)
+        case "model" | "select-model":
+            new_model = args.words
+            fuzzy_select_model(tabby, new_model, args) or sys.exit(1)
 
-    case _:
-        new_model = [args.mode] + args.words
-        fuzzy_select_model(tabby, new_model, args) or sys.exit(1)
+        case _:
+            new_model = [args.mode] + args.words
+            fuzzy_select_model(tabby, new_model, args) or sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
