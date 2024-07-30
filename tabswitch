@@ -33,7 +33,7 @@ LOWER_UPPER_TRANSITION = regex.compile("(?<=[a-z_])(?=[0-9A-Z])", flags=regex.VE
 LU_WORD = re.compile(
     r"""
         (?# Leading)
-        [0-9A-Z]*
+        [0-9A-Z.]*
 
         (?# lower word)
         [^0-9A-Z\s]+
@@ -286,7 +286,7 @@ def simple_term_similarity(doc_term: str, query_term: str) -> float:
 
 def extract_query_term_groups(query: list[str]) -> list[list[str]]:
     return [
-        [w.lower() for w in re.findall(LU_WORD, p)]
+        [term.lower()] + [w.lower() for w in re.findall(LU_WORD, p)]
         for term in query
         for p in re.split(r"[-_\s]", term)
     ]
@@ -323,7 +323,7 @@ def fuzzy_match(
 
     # Index the models by name parts: dash, underscore, lower to upper, lower
     # to digit transitions all count as word separators, but group together
-    # unpunctuatted text so that only the best matches within the group count.
+    # unapunctuated text so that only the best matches within the group count.
     doc_term_corpus: dict[str, list[list[str]]] = {}
     for doc in corpus:
         doc_term_corpus[doc] = extract_doc_term_groups(doc)
