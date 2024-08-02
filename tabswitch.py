@@ -431,6 +431,26 @@ def fuzzy_select_model(tabby: Tabby, query: list[str], args) -> bool:
         r = tabby.swap_model(new_model, args)
         return display_progress(r)
 
+def scaled_int(value, base=10):
+    scale = 1
+    if isinstance(value, str):
+        trunc = 0
+        if value.endswith('k'):
+            scale = 1000
+            trunc = -1
+        elif value.endswith('ki'):
+            scale = 1024
+            trunc = -2
+        elif value.endswith('m') or value.endswith('M'):
+            scale = 1000_000
+            trunc = -1
+        elif value.endswith('mi') or value.endswith('Mi'):
+            scale = 1024*1024
+            trunc = -2
+        if trunc:
+            value = value[:trunc]
+    return int(value, base) * scale
+
 
 def main():
     argparser = argparse.ArgumentParser()
@@ -438,7 +458,48 @@ def main():
     argparser.add_argument(
         "--ctx",
         "--context-length",
-        type=int,
+        "-C",
+        type=scaled_int,
+        dest="max_seq_len",
+        required=False,
+    )
+    argparser.add_argument(
+        "-8",
+        "-8k",
+        action='store_const',
+        const=8192,
+        dest="max_seq_len",
+        required=False,
+    )
+    argparser.add_argument(
+        "-16",
+        "-16k",
+        action='store_const',
+        const=16834,
+        dest="max_seq_len",
+        required=False,
+    )
+    argparser.add_argument(
+        "-32",
+        "-32k",
+        action='store_const',
+        const=32768,
+        dest="max_seq_len",
+        required=False,
+    )
+    argparser.add_argument(
+        "-48",
+        "-48k",
+        action='store_const',
+        const=43008,
+        dest="max_seq_len",
+        required=False,
+    )
+    argparser.add_argument(
+        "-128",
+        "-128k",
+        action='store_const',
+        const=131072,
         dest="max_seq_len",
         required=False,
     )
