@@ -275,14 +275,18 @@ class Tabby:
 
 
 def simple_term_similarity(doc_term: str, query_term: str) -> float:
+    scale = 1.0
+    if query_term.isdigit():
+        scale = 0.25
+
     if doc_term == query_term:
-        return 2.0
+        return 2.0 * scale
     elif doc_term.startswith(query_term):
-        return len(query_term) / len(doc_term) * 0.5
+        return len(query_term) / len(doc_term) * 0.5 * scale
     elif doc_term.endswith(query_term):
-        return len(query_term) / len(doc_term) * 0.45
+        return len(query_term) / len(doc_term) * 0.45 * scale
     elif query_term in doc_term:
-        return len(query_term) / len(doc_term) * 0.05
+        return len(query_term) / len(doc_term) * 0.05 * scale
     return 0.0
 
 
