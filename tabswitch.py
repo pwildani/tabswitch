@@ -223,7 +223,7 @@ class Tabby:
         # Send with admin key: X-Admin-Key header (or bearer auth)
         self.unload()
 
-        data: dict[str, float | int | str] = {
+        data: dict[str, float | int | str | dict] = {
             "name": new_model,
         }
         if config.cache_mode:
@@ -234,7 +234,9 @@ class Tabby:
 
         if config.max_seq_len:
             data["max_seq_len"] = config.max_seq_len
-        # set {draft:{draft_model_name:}} to operate on draft model?
+
+        if hasattr(config, 'draft') and config.draft:
+            data["draft"] = config.draft
 
         postdata = json.dumps(data)
 
@@ -417,21 +419,24 @@ def exllama2_bias(parts: list[str]) -> float:
     return bias
 
 
-def fuzzy_select_model(tabby: Tabby, query: list[str], args) -> bool:
-    model_names = tabby.model_names()
+def fuzzy_select_model(tabby: Tabby, query: list[str], args, is_draft: bool = False) -> bool:
+    model_names = tabby.get_available_draft_models() if is_draft else tabby.model_names()
+    model_names = [m["id"] for m in model_names]
     models = fuzzy_match(model_names, query, bias_fn=exllama2_bias)
     # select the models with the top score
     models = [m for m, s in models if s == models[0][1]]
     if len(models) == 0:
-        print("No matching models")
-        sys.exit(1)
+        print(f"No matching {'draft ' if is_draft else ''}models")
+        return False
     if len(models) != 1:
-        print("Multiple matching models:")
+        print(f"Multiple matching {'draft ' if is_draft else ''}models:")
         for model in models:
             print(model)
         return False
     else:
         new_model = models[0]
+        if is_draft:
+            args.draft = {"name": new_model}
         r = tabby.swap_model(new_model, args)
         return display_progress(r)
 
@@ -524,7 +529,12 @@ def main():
         required=False,
     )
     argparser.add_argument("words", metavar="modelword", type=str, nargs="*")
-    args = argparser.parse_args()
+    argparser.add_argument(
+        "--draft-model", "-D", type=str, dest="draft_model", required=False,
+        help="Select a draft model to use alongside the main model"
+    )
+    args = argparse.Namespace()
+    args, unknown = argparser.parse_known_args(namespace=args)
     tabby = Tabby.from_app_config("tabswitch")
 
     match args.mode:
@@ -562,11 +572,19 @@ def main():
 
         case "model" | "select-model":
             new_model = args.words
-            fuzzy_select_model(tabby, new_model, args) or sys.exit(1)
+            if not fuzzy_select_model(tabby, new_model, args):
+                sys.exit(1)
+            if args.draft_model:
+                if not fuzzy_select_model(tabby, [args.draft_model], args, is_draft=True):
+                    sys.exit(1)
 
         case _:
             new_model = [args.mode] + args.words
-            fuzzy_select_model(tabby, new_model, args) or sys.exit(1)
+            if not fuzzy_select_model(tabby, new_model, args):
+                sys.exit(1)
+            if args.draft_model:
+                if not fuzzy_select_model(tabby, [args.draft_model], args, is_draft=True):
+                    sys.exit(1)
 
 
 if __name__ == "__main__":
