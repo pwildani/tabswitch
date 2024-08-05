@@ -20,12 +20,13 @@ except ImportError:
     from unittest.mock import MagicMock
 
     tqdm = MagicMock()
+    tqdm.display = print
 
 
 T = typing.TypeVar("T")
 
 # Couldn't get zero width split working.
-#LOWER_UPPER_TRANSITION = regex.compile("(?<=[a-z_])(?=[0-9A-Z])", flags=regex.VERSION1)
+# LOWER_UPPER_TRANSITION = regex.compile("(?<=[a-z_])(?=[0-9A-Z])", flags=regex.VERSION1)
 
 # Matches a word terminated by a lower-upper case transition,
 # or lower-digit transition, or whitespace
@@ -188,6 +189,8 @@ class Tabby:
         self.set_auth_headers(headers)
         kw["headers"] = headers
         url = self.api_root + path
+        # if args.verbose > DEBUG:
+        #     print("POST", url, ": ", data)
         try:
             response = requests.post(url, data=data, **kw)
             return response
@@ -218,10 +221,18 @@ class Tabby:
     def unload(self) -> None:
         self.post("v1/model/unload", None)
 
-    def swap_model(self, new_model: str, config: ModelConfig) -> None:
+    def noisy_unload(self) -> None:
+        current = self.get_loaded_model()
+        if "id" in current:
+            print(f"Unloading {current['id']}")
+        self.unload()
+
+    def swap_model(
+        self, new_model: str, config: ModelConfig, draft_model: str = None
+    ) -> None:
         # Select model
         # Send with admin key: X-Admin-Key header (or bearer auth)
-        self.unload()
+        self.noisy_unload()
 
         data: dict[str, float | int | str | dict] = {
             "name": new_model,
@@ -235,8 +246,10 @@ class Tabby:
         if config.max_seq_len:
             data["max_seq_len"] = config.max_seq_len
 
-        if hasattr(config, 'draft') and config.draft:
+        if hasattr(config, "draft") and config.draft:
             data["draft"] = config.draft
+        if draft_model:
+            data["draft"] = {"draft_model_name": draft_model}
 
         postdata = json.dumps(data)
 
@@ -375,32 +388,65 @@ def fuzzy_match(
     return top_hits
 
 
-def display_progress(r: requests.Response):
+def display_progress(r: requests.Response, stages: dict[str, str]):
     err = None
-    with tqdm(unit=" Layers") as pb:
-        pb.refresh()
+    pb = {}
+    row = {}
+    print()
+    i = 0
+    for k, v in reversed(list(stages.items())):
+        if v:
+            row[k] = i * 2 - 1
+            i += 1
+            pb[k] = tqdm(unit=f" {k} layers", position=row[k] + 1, leave=True)
+        else:
+            del stages[k]
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def parallel(*a):
+        with contextlib.ExitStack() as ex:
+            for k in a:
+                p = ex.enter_context(k)
+            yield
+
+    with parallel(*pb.values()):
+        for i, (k, v) in enumerate(stages.items()):
+            pb[k].display(f"Loading {v}", pos=row[k])
+
+        # N.B. k is assumed to be initialized for error handling here!
         for line in r.iter_lines(chunk_size=None):
             if not line:
                 continue
             line = line.removeprefix(b"data: ")
             j = json.loads(line)
+
             if "modules" in j:
+                k = j.get("model_type", "model")
                 n = int(j.get("module", 0))
                 tot = int(j.get("modules", 1))
-                pb.total = tot
-                pb.n = n
-                pb.refresh()
+                if j["status"] == "finished":
+                    pb[k].clear()
+                    pb[k].display(
+                        f"Loaded {stages.get(j['model_type'], j['model_type'])}  ",
+                        pos=row[k],
+                    )
+                pb[k].total = tot
+                pb[k].n = n
+                pb[k].refresh()
+                if j["status"] == "finished":
+                    pb[k].disable = True
             else:
-                # allocate a line above the progress bar and fill it with the full error
-                pb.clear()
-                print()
-                pb.display(line.decode("utf-8"), pos=-1)
+                pb[k].clear()
+                pb[k].display(line.decode("utf-8"), pos=row[k])
 
                 # Could do this above, but there's more info than just the error message sometimes.
                 if "error" in j:
-                    err = j["error"]["message"]
+                    err = stages[k] + ": " + j["error"]["message"]
                     break
-
+        # Shift to after the message+progressbar combo
+        print("\n\n" * (len(stages) - 1))
     # display the error after the progress bar
     # cleans up its UI.
     if err:
@@ -419,42 +465,54 @@ def exllama2_bias(parts: list[str]) -> float:
     return bias
 
 
-def fuzzy_select_model(tabby: Tabby, query: list[str], args, is_draft: bool = False) -> bool:
-    model_names = tabby.get_available_draft_models() if is_draft else tabby.model_names()
-    model_names = [m["id"] for m in model_names]
-    models = fuzzy_match(model_names, query, bias_fn=exllama2_bias)
-    # select the models with the top score
-    models = [m for m, s in models if s == models[0][1]]
-    if len(models) == 0:
-        print(f"No matching {'draft ' if is_draft else ''}models")
+def fuzzy_select_model(
+    tabby: Tabby, query: list[str], args, draft_query: list[str] | tuple[str] = ()
+) -> bool:
+    def _best_fuzzy_model(models, query, is_draft):
+        model_names = [m["id"] for m in models]
+        models = fuzzy_match(model_names, query, bias_fn=exllama2_bias)
+        # select the models with the top score
+        models = [m for m, s in models if s == models[0][1]]
+        if len(models) == 0:
+            print(f"No matching {'draft ' if is_draft else ''}models")
+            return False
+        if len(models) != 1:
+            print(f"Multiple matching {'draft ' if is_draft else ''}models:")
+            for model in models:
+                print(model)
+            return False
+        return models[0]
+
+    models = tabby.get_available_models()
+    new_model = _best_fuzzy_model(models, query, False)
+    draft_model = None
+
+    if draft_query:
+        draft_models = tabby.get_available_draft_models()
+        draft_model = _best_fuzzy_model(draft_models, draft_query, is_draft=True)
+
+    if not new_model or (draft_query and not draft_model):
         return False
-    if len(models) != 1:
-        print(f"Multiple matching {'draft ' if is_draft else ''}models:")
-        for model in models:
-            print(model)
-        return False
-    else:
-        new_model = models[0]
-        if is_draft:
-            args.draft = {"name": new_model}
-        r = tabby.swap_model(new_model, args)
-        return display_progress(r)
+
+    r = tabby.swap_model(new_model, args, draft_model=draft_model)
+    return display_progress(r, {"model": new_model, "draft": draft_model})
+
 
 def scaled_int(value, base=10):
     scale = 1
     if isinstance(value, str):
         trunc = 0
-        if value.endswith('k'):
+        if value.endswith("k"):
             scale = 1000
             trunc = -1
-        elif value.endswith('ki'):
+        elif value.endswith("ki"):
             scale = 1024
             trunc = -2
-        elif value.endswith('m') or value.endswith('M'):
+        elif value.endswith("m") or value.endswith("M"):
             scale = 1000_000
             trunc = -1
-        elif value.endswith('mi') or value.endswith('Mi'):
-            scale = 1024*1024
+        elif value.endswith("mi") or value.endswith("Mi"):
+            scale = 1024 * 1024
             trunc = -2
         if trunc:
             value = value[:trunc]
@@ -475,7 +533,7 @@ def main():
     argparser.add_argument(
         "-8",
         "-8k",
-        action='store_const',
+        action="store_const",
         const=8192,
         dest="max_seq_len",
         required=False,
@@ -483,7 +541,7 @@ def main():
     argparser.add_argument(
         "-16",
         "-16k",
-        action='store_const',
+        action="store_const",
         const=16834,
         dest="max_seq_len",
         required=False,
@@ -491,7 +549,7 @@ def main():
     argparser.add_argument(
         "-32",
         "-32k",
-        action='store_const',
+        action="store_const",
         const=32768,
         dest="max_seq_len",
         required=False,
@@ -499,7 +557,7 @@ def main():
     argparser.add_argument(
         "-48",
         "-48k",
-        action='store_const',
+        action="store_const",
         const=43008,
         dest="max_seq_len",
         required=False,
@@ -507,7 +565,7 @@ def main():
     argparser.add_argument(
         "-128",
         "-128k",
-        action='store_const',
+        action="store_const",
         const=131072,
         dest="max_seq_len",
         required=False,
@@ -530,26 +588,32 @@ def main():
     )
     argparser.add_argument("words", metavar="modelword", type=str, nargs="*")
     argparser.add_argument(
-        "--draft-model", "-D", type=str, dest="draft_model", required=False,
-        help="Select a draft model to use alongside the main model"
+        "--draft-model",
+        "-D",
+        dest="draft_model",
+        required=False,
+        nargs="*",
+        help="Select a draft model to use alongside the main model",
     )
     args = argparse.Namespace()
     args, unknown = argparser.parse_known_args(namespace=args)
     tabby = Tabby.from_app_config("tabswitch")
+    # print(args, unknown)
 
     match args.mode:
         case "help":
             print(
-                "current, list, set-model <exact name>, "
+                "$0 current, list, list-draft, set-model <exact name>, "
                 "model <approximate name>, select-model <approximate name>, "
                 "or just <approximate name>"
+                "Add --draft-model|-D <approximate name> to select a draft model"
             )
 
         case None | "current":
             print(tabby.get_loaded_model())
 
         case "unload":
-            tabby.unload()
+            tabby.noisy_unload()
 
         case "ls" | "list" | "list-models":
             query = args.words
@@ -565,26 +629,39 @@ def main():
                 for m in models:
                     print(m)
 
+        case "list-draft":
+            models = tabby.get_available_draft_models()
+            model_names = [m["id"] for m in models]
+            query = args.words
+            if query:
+                models = fuzzy_match(model_names, query, bias_fn=exllama2_bias)
+                for m, score in models:
+                    print(f"{score:0.3}\t{m}")
+            else:
+                model_names.sort()
+                for m in model_names:
+                    print(m)
+
         case "set-model":
             new_model = args.words[0]
-            r = tabby.swap_model(new_model, args)
-            display_progress(r) or sys.exit(1)
+            r = tabby.swap_model(new_model, args, draft_model=args.draft_model[0])
+            display_progress(
+                r, {"model": new_model, "draft": args.draft_model[0]}
+            ) or sys.exit(1)
 
         case "model" | "select-model":
             new_model = args.words
-            if not fuzzy_select_model(tabby, new_model, args):
+            if not fuzzy_select_model(
+                tabby, new_model, args, draft_query=args.draft_model
+            ):
                 sys.exit(1)
-            if args.draft_model:
-                if not fuzzy_select_model(tabby, [args.draft_model], args, is_draft=True):
-                    sys.exit(1)
 
         case _:
             new_model = [args.mode] + args.words
-            if not fuzzy_select_model(tabby, new_model, args):
+            if not fuzzy_select_model(
+                tabby, new_model, args, draft_query=args.draft_model
+            ):
                 sys.exit(1)
-            if args.draft_model:
-                if not fuzzy_select_model(tabby, [args.draft_model], args, is_draft=True):
-                    sys.exit(1)
 
 
 if __name__ == "__main__":
