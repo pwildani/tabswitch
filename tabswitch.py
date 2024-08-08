@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 from collections import defaultdict
 from pathlib import Path
-from typing import TypedDict, Protocol
+from typing import TypedDict, Protocol, Literal
 import argparse
 import configparser
 import json
@@ -52,10 +52,12 @@ LU_WORD = re.compile(
 )
 
 
-class ModelConfig(Protocol):
+class ModelLoadRequest(Protocol):
     cache_mode: str | None
     prompt_template: str | None
     max_seq_len: int | None
+    cache_size: int | None
+    gpu_split: None | list[int]
 
 
 class EncodeTokensResponse(TypedDict):
@@ -219,16 +221,20 @@ class Tabby:
         return resp["data"]
 
     def unload(self) -> None:
-        self.post("v1/model/unload", None)
+        return self.post("v1/model/unload", None)
 
     def noisy_unload(self) -> None:
         current = self.get_loaded_model()
+        stages = {}
         if "id" in current:
-            print(f"Unloading {current['id']}")
+            print(f"Unloading {current['id']}", end="\r")
+            stages["model"] = current["id"]
         self.unload()
+        if "id" in current:
+            print(f"Unloaded {current['id']} ")
 
     def swap_model(
-        self, new_model: str, config: ModelConfig, draft_model: str = None
+        self, new_model: str, config: ModelLoadRequest, draft_model: str = None
     ) -> None:
         # Select model
         # Send with admin key: X-Admin-Key header (or bearer auth)
@@ -243,8 +249,13 @@ class Tabby:
         if config.prompt_template:
             data["prompt_template"] = config.prompt_template
 
-        if config.max_seq_len:
+        if config.max_seq_len is not None:
             data["max_seq_len"] = config.max_seq_len
+        if config.cache_size is not None:
+            data["cache_size"] = config.cache_size
+        if config.gpu_split is not None:
+            data["gpu_split"] = config.gpu_split
+            data["gpu_split_auto"] = False
 
         if hasattr(config, "draft") and config.draft:
             data["draft"] = config.draft
@@ -401,6 +412,10 @@ def display_progress(r: requests.Response, stages: dict[str, str]):
             pb[k] = tqdm(unit=f" {k} layers", position=row[k] + 1, leave=True)
         else:
             del stages[k]
+    if not stages:
+        k = "model"
+        row[k] = 1
+        pb[k] = tqdm(unit=" Unknown", position=2, leave=True)
 
     import contextlib
 
@@ -519,6 +534,45 @@ def scaled_int(value, base=10):
     return int(value, base) * scale
 
 
+import readline  # for interactive input
+
+
+def interactive_query(
+    tabby,
+    mode: Literal["chat"] | Literal["completion"] = "chat",
+    system_prompt: str = None,
+):
+    messages = []
+    settings = SamplerSettings()
+
+    if system_prompt and mode == "chat":
+        messages.append({"role": "system", "content": system_prompt})
+
+    while True:
+        try:
+            prompt = input(": ")
+        except (KeyboardInterrupt, EOFError):
+            break
+        if prompt.lower() == "exit":
+            break
+        if not prompt:
+            break
+
+        if mode == "completion":
+            settings = SamplerSettings()
+            full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+            print(tabby.completions(full_prompt, settings))
+        elif mode == "chat":
+            messages.append({"role": "user", "content": prompt})
+            response = tabby.chat_completions(messages, settings)
+            try:
+                r = response["choices"][0]["message"]["content"]
+                print(r)
+                messages.append(response["choices"][0]["message"])
+            except:
+                print(response)
+
+
 def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument("mode", metavar="mode", type=str, nargs="?")
@@ -586,6 +640,21 @@ def main():
         choices=["Q4", "FP8", "FP16"],
         required=False,
     )
+    argparser.add_argument(
+        "--cache-size",
+        type=scaled_int,
+        dest="cache_size",
+        default=None,
+        required=False,
+    )
+    argparser.add_argument(
+        "--gpu-split",
+        "-G",
+        type=lambda x: list(map(float, x.split(","))),
+        dest="gpu_split",
+        default=None,
+        required=False,
+    )
     argparser.add_argument("words", metavar="modelword", type=str, nargs="*")
     argparser.add_argument(
         "--draft-model",
@@ -594,6 +663,13 @@ def main():
         required=False,
         nargs="*",
         help="Select a draft model to use alongside the main model",
+    )
+    argparser.add_argument(
+        "--system-prompt",
+        "-S",
+        type=str,
+        dest="system_prompt",
+        help="Set a system prompt for chat and completion modes",
     )
     args = argparse.Namespace()
     args, unknown = argparser.parse_known_args(namespace=args)
@@ -656,7 +732,17 @@ def main():
             ):
                 sys.exit(1)
 
+        case "interactive":
+            interactive_query(tabby, system_prompt=args.system_prompt)
+        case "chat":
+            interactive_query(tabby, mode="chat", system_prompt=args.system_prompt)
+        case "complete" | "text" | "completion":
+            interactive_query(
+                tabby, mode="completion", system_prompt=args.system_prompt
+            )
+
         case _:
+            print(args)
             new_model = [args.mode] + args.words
             if not fuzzy_select_model(
                 tabby, new_model, args, draft_query=args.draft_model
